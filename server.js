@@ -18,6 +18,9 @@ app.use(express.json());
 // 1. Base de Datos (PostgreSQL Privada del Satélite)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
 // 2. Configuración de Google Drive (Service Account)
@@ -38,14 +41,17 @@ const verifyToken = (req, res, next) => {
 
   if (!token) return res.status(401).json({ error: 'Token requerido' });
 
-  // Verificamos la firma usando el secreto compartido con el Master (Supabase)
   jwt.verify(token, process.env.SUPABASE_JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Token inválido o expirado' });
-    req.user = user; // Inyectamos el usuario en la request
+    if (err) {
+      // 🚨 ESTO IMPRIMIRÁ EL ERROR REAL EN TU TERMINAL
+      console.error("❌ ERROR JWT:", err.message); 
+      console.log("Secreto usado:", process.env.SUPABASE_JWT_SECRET); // Para verificar que lo lee bien
+      return res.status(403).json({ error: 'Token inválido o expirado', details: err.message });
+    }
+    req.user = user;
     next();
   });
 };
-
 // --- RUTAS DE LA API (Endpoints) ---
 
 // A. OBTENER ALUMNOS (Con Filtros y Búsqueda)
