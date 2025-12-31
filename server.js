@@ -1,8 +1,8 @@
-// server.js - Satélite Punto Kennedy
+// server.js - Satélite Punto Kennedy (Versión Supabase Client)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
+const { createClient } = require('@supabase/supabase-js'); // ✅ Cambio principal
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const { google } = require('googleapis');
@@ -15,23 +15,22 @@ const port = process.env.PORT || 4001;
 app.use(cors());
 app.use(express.json());
 
-// 1. Base de Datos (PostgreSQL Privada del Satélite)
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
-});
+// 1. Conexión a Supabase (Cliente Oficial)
+// Usamos la SERVICE_ROLE_KEY para tener permisos de administrador (leer/escribir todo)
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // 2. Configuración de Google Drive (Service Account)
-// Asegúrate de tener el archivo 'service-account.json' en la raíz o usar variables de entorno
+// Asegúrate de tener el archivo 'service-account.json' en la raíz
 const auth = new google.auth.GoogleAuth({
-  keyFile: 'service-account.json', // Tu archivo de credenciales de GCP
+  keyFile: 'service-account.json', 
   scopes: ['https://www.googleapis.com/auth/drive'],
 });
 const drive = google.drive({ version: 'v3', auth });
 
-// Configuración de Multer (Almacenamiento temporal en RAM para subida rápida)
+// Configuración de Multer (Almacenamiento temporal en RAM)
 const upload = multer({ storage: multer.memoryStorage() });
 
 // --- MIDDLEWARE DE SEGURIDAD (Vintex Auth) ---
@@ -41,17 +40,17 @@ const verifyToken = (req, res, next) => {
 
   if (!token) return res.status(401).json({ error: 'Token requerido' });
 
+  // Verificamos el token firmado por el MASTER usando su secreto
   jwt.verify(token, process.env.SUPABASE_JWT_SECRET, (err, user) => {
     if (err) {
-      // 🚨 ESTO IMPRIMIRÁ EL ERROR REAL EN TU TERMINAL
       console.error("❌ ERROR JWT:", err.message); 
-      console.log("Secreto usado:", process.env.SUPABASE_JWT_SECRET); // Para verificar que lo lee bien
-      return res.status(403).json({ error: 'Token inválido o expirado', details: err.message });
+      return res.status(403).json({ error: 'Token inválido o expirado' });
     }
     req.user = user;
     next();
   });
 };
+
 // --- RUTAS DE LA API (Endpoints) ---
 
 // A. OBTENER ALUMNOS (Con Filtros y Búsqueda)
@@ -59,110 +58,111 @@ app.get('/api/students', verifyToken, async (req, res) => {
   try {
     const { search, location, status, page = 1 } = req.query;
     const limit = 20;
-    const offset = (page - 1) * limit;
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
 
-    let query = `
-      SELECT id, full_name, dni, career_interest, status, location, last_interaction_at 
-      FROM students 
-      WHERE 1=1
-    `;
-    const params = [];
-    let paramCount = 1;
+    // Construcción de la consulta ("Query Builder")
+    let query = supabase
+      .from('students')
+      .select('id, full_name, dni, career_interest, status, location, last_interaction_at', { count: 'exact' });
 
-    // Filtro inteligente (Busca por Nombre O DNI)
+    // 1. Filtro inteligente (Busca por Nombre O DNI)
     if (search) {
-      query += ` AND (full_name ILIKE $${paramCount} OR dni ILIKE $${paramCount})`;
-      params.push(`%${search}%`);
-      paramCount++;
+      // Sintaxis de Supabase para OR: "columna.operador.valor, columna.operador.valor"
+      query = query.or(`full_name.ilike.%${search}%,dni.ilike.%${search}%`);
     }
 
-    // Filtro por Sede (Vital para Florencia y Rita)
+    // 2. Filtro por Sede
     if (location && location !== 'Todas') {
-      query += ` AND location = $${paramCount}`;
-      params.push(location);
-      paramCount++;
+      query = query.eq('location', location);
     }
 
-    if (status) {
-        query += ` AND status = $${paramCount}`;
-        params.push(status);
-        paramCount++;
+    // 3. Filtro por Estado
+    if (status && status !== 'Todos') {
+      query = query.eq('status', status);
     }
 
-    query += ` ORDER BY last_interaction_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
-    params.push(limit, offset);
+    // Ordenamiento y Paginación
+    query = query
+      .order('last_interaction_at', { ascending: false })
+      .range(from, to);
 
-    const result = await pool.query(query, params);
-    
-    // Contar total para paginación
-    const countResult = await pool.query('SELECT COUNT(*) FROM students');
+    // Ejecutar consulta
+    const { data, error, count } = await query;
+
+    if (error) throw error;
     
     res.json({
-      data: result.rows,
-      total: parseInt(countResult.rows[0].count),
+      data: data,
+      total: count,
       page: parseInt(page)
     });
+
   } catch (err) {
-    console.error(err);
+    console.error('Error Supabase:', err.message);
     res.status(500).json({ error: 'Error al obtener alumnos' });
   }
 });
 
 // B. CREAR NUEVO PROSPECTO/ALUMNO
 app.post('/api/students', verifyToken, async (req, res) => {
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
     const { 
       full_name, dni, contact_phone, contact_email, 
       career_interest, location, is_student_the_contact, contact_person_name,
       notes 
     } = req.body;
 
-    const query = `
-      INSERT INTO students (
-        full_name, dni, contact_phone, contact_email, 
-        career_interest, location, is_student_the_contact, contact_person_name,
-        general_notes, status
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Sólo preguntó')
-      RETURNING id
-    `;
-    
-    const values = [
-      full_name, dni, contact_phone, contact_email,
-      career_interest, location || 'Catamarca', is_student_the_contact, contact_person_name,
-      notes
-    ];
+    const { data, error } = await supabase
+      .from('students')
+      .insert([
+        {
+          full_name,
+          dni,
+          contact_phone,
+          contact_email,
+          career_interest,
+          location: location || 'Catamarca',
+          is_student_the_contact,
+          contact_person_name,
+          general_notes: notes,
+          status: 'Sólo preguntó'
+        }
+      ])
+      .select('id') // Pedimos que nos devuelva el ID creado
+      .single();
 
-    const result = await client.query(query, values);
-    
-    // Crear carpeta base en Drive para este alumno (Opcional, para orden)
+    if (error) throw error;
+
+    // Crear carpeta base en Drive (Opcional, lógica comentada igual que antes)
     // createDriveFolder(dni + '_' + full_name); 
 
-    await client.query('COMMIT');
-    res.status(201).json({ message: 'Alumno creado', id: result.rows[0].id });
+    res.status(201).json({ message: 'Alumno creado', id: data.id });
+
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).json({ error: 'Error creando alumno (Posible DNI duplicado)' });
-  } finally {
-    client.release();
+    console.error('Error creando alumno:', err.message);
+    // Manejo de duplicados (código de error Postgres para Unique Violation es 23505)
+    if (err.code === '23505') {
+        res.status(500).json({ error: 'El DNI ya existe en la base de datos' });
+    } else {
+        res.status(500).json({ error: 'Error creando alumno' });
+    }
   }
 });
 
-// C. SUBIR DOCUMENTOS (Proxy: React -> Node -> Google Drive)
+// C. SUBIR DOCUMENTOS (Proxy: React -> Node -> Google Drive -> DB)
 app.post('/api/students/:id/documents', verifyToken, upload.single('file'), async (req, res) => {
   try {
     const studentId = req.params.id;
-    const { documentType } = req.body; // Ej: 'DNI Frontal'
+    const { documentType } = req.body; 
     const file = req.file;
 
     if (!file) return res.status(400).json({ error: 'No se envió archivo' });
 
-    // 1. Subir a Google Drive
+    // 1. Subir a Google Drive (Esto sigue igual, usa la librería de Google)
     const fileMetadata = {
       name: `${documentType}_${Date.now()}_${file.originalname}`,
-      parents: [process.env.GOOGLE_DRIVE_FOLDER_ID], // ID de la carpeta "PuntoKennedy_Legajos"
+      parents: [process.env.GOOGLE_DRIVE_FOLDER_ID], 
     };
 
     const media = {
@@ -173,51 +173,57 @@ app.post('/api/students/:id/documents', verifyToken, upload.single('file'), asyn
     const driveResponse = await drive.files.create({
       resource: fileMetadata,
       media: media,
-      fields: 'id, webViewLink',
+      fields: 'id',
     });
 
-    // 2. Guardar referencia en SQL
-    const query = `
-      INSERT INTO student_documents (student_id, document_type, drive_file_id, file_name, mime_type)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING id, drive_file_id
-    `;
-    
-    await pool.query(query, [
-      studentId, 
-      documentType, 
-      driveResponse.data.id, 
-      file.originalname,
-      file.mimetype
-    ]);
+    // 2. Guardar referencia en Supabase
+    const { data, error } = await supabase
+      .from('student_documents')
+      .insert([
+        {
+          student_id: studentId,
+          document_type: documentType,
+          drive_file_id: driveResponse.data.id,
+          file_name: file.originalname,
+          mime_type: file.mimetype
+        }
+      ])
+      .select('id, drive_file_id')
+      .single();
+
+    if (error) throw error;
 
     res.json({ success: true, fileId: driveResponse.data.id });
 
   } catch (err) {
-    console.error('Error subiendo a Drive:', err);
+    console.error('Error subiendo documento:', err);
     res.status(500).json({ error: 'Fallo la subida del documento' });
   }
 });
 
 // D. DESCARGAR DOCUMENTOS (Proxy: Drive -> Node -> Navegador)
-// Esto permite descargar sin hacer público el archivo
 app.get('/api/documents/:id/download', verifyToken, async (req, res) => {
   try {
     const docId = req.params.id;
     
-    // 1. Obtener ID de Drive de la DB
-    const result = await pool.query('SELECT drive_file_id, file_name, mime_type FROM student_documents WHERE id = $1', [docId]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Documento no encontrado' });
+    // 1. Obtener ID de Drive desde Supabase
+    const { data, error } = await supabase
+      .from('student_documents')
+      .select('drive_file_id, file_name, mime_type')
+      .eq('id', docId)
+      .single();
 
-    const { drive_file_id, file_name, mime_type } = result.rows[0];
+    if (error || !data) return res.status(404).json({ error: 'Documento no encontrado' });
 
-    // 2. Pedir el stream a Google
+    const { drive_file_id, file_name, mime_type } = data;
+
+    // 2. Pedir el stream a Google (Igual que antes)
     const driveStream = await drive.files.get(
       { fileId: drive_file_id, alt: 'media' },
       { responseType: 'stream' }
     );
 
-    // 3. Pipear (retransmitir) al cliente
+    // 3. Pipear al cliente
     res.setHeader('Content-Disposition', `attachment; filename="${file_name}"`);
     res.setHeader('Content-Type', mime_type);
     
@@ -235,22 +241,24 @@ app.get('/api/documents/:id/download', verifyToken, async (req, res) => {
   }
 });
 
-// E. DETALLE COMPLETO DEL ALUMNO (Para el Modal)
+// E. DETALLE COMPLETO DEL ALUMNO
 app.get('/api/students/:id', verifyToken, async (req, res) => {
     try {
         const studentId = req.params.id;
 
-        // Datos básicos
-        const studentRes = await pool.query('SELECT * FROM students WHERE id = $1', [studentId]);
-        
-        // Documentos
-        const docsRes = await pool.query('SELECT id, document_type, file_name, uploaded_at FROM student_documents WHERE student_id = $1', [studentId]);
+        // Fetch en paralelo para optimizar velocidad
+        const [studentRes, docsRes] = await Promise.all([
+            supabase.from('students').select('*').eq('id', studentId).single(),
+            supabase.from('student_documents').select('id, document_type, file_name, uploaded_at').eq('student_id', studentId)
+        ]);
 
-        if (studentRes.rows.length === 0) return res.status(404).json({ error: 'Alumno no encontrado' });
+        if (studentRes.error) {
+            return res.status(404).json({ error: 'Alumno no encontrado' });
+        }
 
         res.json({
-            student: studentRes.rows[0],
-            documents: docsRes.rows
+            student: studentRes.data,
+            documents: docsRes.data || []
         });
 
     } catch (err) {
@@ -260,5 +268,5 @@ app.get('/api/students/:id', verifyToken, async (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`📡 Satélite Punto Kennedy activo en puerto ${port}`);
+  console.log(`📡 Satélite Punto Kennedy (Supabase JS) activo en puerto ${port}`);
 });
