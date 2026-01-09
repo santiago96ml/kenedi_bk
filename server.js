@@ -88,6 +88,7 @@ app.put('/api/bot', verifyToken, async (req, res) => {
 });
 
 // 3. ALUMNOS (Con Join a Carreras)
+// 3. ALUMNOS (Con Join a Carreras y Búsqueda por Legajo)
 app.get('/api/students', verifyToken, async (req, res) => {
   try {
     const { search, career_id, status, page = 1 } = req.query;
@@ -103,7 +104,11 @@ app.get('/api/students', verifyToken, async (req, res) => {
         careers ( name, fees )
       `, { count: 'exact' });
 
-    if (search) query = query.or(`full_name.ilike.%${search}%,dni.ilike.%${search}%`);
+    // --- CAMBIO AQUÍ: Agregamos legajo.ilike.%${search}% ---
+    if (search) {
+      query = query.or(`full_name.ilike.%${search}%,dni.ilike.%${search}%,legajo.ilike.%${search}%`);
+    }
+
     if (career_id) query = query.eq('career_id', career_id);
     if (status && status !== 'Todos') query = query.eq('status', status);
 
@@ -123,14 +128,18 @@ app.get('/api/students', verifyToken, async (req, res) => {
 app.post('/api/students', verifyToken, async (req, res) => {
   try {
     const { 
-      full_name, dni, contact_phone, career_id, // Ahora usamos ID de carrera
+      full_name, dni, legajo, // <--- CAMBIO AQUÍ: Recibimos legajo
+      contact_phone, career_id, 
       location, notes 
     } = req.body;
 
     const { data, error } = await supabase
       .from('students')
       .insert([{
-        full_name, dni, contact_phone, 
+        full_name,
+        dni,
+        legajo: legajo || null, // <--- CAMBIO AQUÍ: Lo guardamos (o null si viene vacío)
+        contact_phone, 
         career_id, 
         location: location || 'Catamarca',
         general_notes: notes,
@@ -142,7 +151,13 @@ app.post('/api/students', verifyToken, async (req, res) => {
     if (error) throw error;
     res.status(201).json({ message: 'Alumno creado', id: data.id });
   } catch (err) {
-    if (err.code === '23505') return res.status(400).json({ error: 'DNI ya existe' });
+    // Manejo de errores de duplicados (DNI o Legajo)
+    if (err.code === '23505') {
+        if (err.message.includes('legajo')) {
+             return res.status(400).json({ error: 'El Legajo ya existe' });
+        }
+        return res.status(400).json({ error: 'El DNI ya existe' });
+    }
     res.status(500).json({ error: 'Error creando alumno' });
   }
 });
@@ -248,6 +263,54 @@ app.get('/api/students/:id', verifyToken, async (req, res) => {
     } catch (err) {
         res.status(500).json({ error: 'Error servidor' });
     }
+});
+
+// --- RUTA NUEVA: Generar Texto con IA (Proxy Seguro) ---
+app.post('/api/ai/generate', verifyToken, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'Prompt requerido' });
+
+    // 1. Limpieza de la llave (Vital para evitar errores de espacios)
+    const rawKey = process.env.OPENROUTER_API_KEY;
+    const apiKey = rawKey ? rawKey.trim() : "";
+
+    console.log("🔑 Enviando a OpenRouter...", apiKey ? "OK (Key presente)" : "ERROR (Key vacía)");
+
+    // 2. Petición a OpenRouter
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://vintex.net.br", // Requerido por OpenRouter
+        "X-Title": "Vintex AI",                  // Requerido por OpenRouter
+      },
+      body: JSON.stringify({
+        model: "xiaomi/mimo-v2-flash:free",
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+
+    if (!response.ok) {
+      const errData = await response.text();
+      console.error("❌ Error OpenRouter:", response.status, errData);
+      // Si el error es 401, avisamos claramente que la llave está mal
+      if (response.status === 401) {
+          return res.status(401).json({ error: 'La API Key de OpenRouter ha caducado o es inválida.' });
+      }
+      return res.status(response.status).json({ error: `Error proveedor IA (${response.status})` });
+    }
+
+    const data = await response.json();
+    const resultText = data.choices?.[0]?.message?.content || "No se pudo generar respuesta.";
+    
+    res.json({ result: resultText });
+
+  } catch (err) {
+    console.error("🔥 Error Servidor IA:", err.message);
+    res.status(500).json({ error: 'Error interno del servidor IA' });
+  }
 });
 
 app.listen(port, () => {
