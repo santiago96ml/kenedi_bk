@@ -1,0 +1,52 @@
+# ==========================================
+# CONFIGURACIÓN DEL SERVIDOR
+# ==========================================
+PORT=4001
+NODE_ENV=production
+# Cambia a "development" para desarrollo local
+
+# ==========================================
+# SUPABASE
+# ==========================================
+# URL de tu proyecto Supabase (ejemplo: https://xxxxx.supabase.co)
+SUPABASE_URL=https://iljpmweuterernqyxvdk.supabase.co
+
+# Service Role Key (clave con todos los permisos)
+# IMPORTANTE: Esta clave nunca debe exponerse al frontend
+SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlsanBtd2V1dGVyZXJucXl4dmRrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NzAyODM0MywiZXhwIjoyMDgyNjA0MzQzfQ.tEUwB4jeozEctjEfT_7lIzVavJoZ05A6kQXvg0-SGNg
+
+# JWT Secret para verificar tokens
+# Se encuentra en: Supabase Dashboard > Settings > API > JWT Secret
+SUPABASE_JWT_SECRET=eCF1sE4uNxuY86z1KHIWOzS1CeS+cIFdnacDeBIw5FTHQ9nAIvHpvru6c+VMvXX9Hi8PEaJXP6w8ORt48B1/9A==
+
+# ==========================================
+# GOOGLE DRIVE
+# ==========================================
+# ID de la carpeta donde se guardarán los documentos
+# Ejemplo: 1A2B3C4D5E6F7G8H9I0J
+GOOGLE_DRIVE_FOLDER_ID=tu_folder_id_aqui
+
+# Ruta al archivo service-account.json (credenciales de Google Cloud)
+# Por defecto busca en la raíz del proyecto
+GOOGLE_SERVICE_ACCOUNT_PATH=1wAy7NLZGSGXVcmIS5kC0SSw12xwTRUrR
+
+# ==========================================
+# OPENROUTER AI (Opcional)
+# ==========================================
+# API Key de OpenRouter para funciones de IA
+# Si no la tienes, las funciones de IA estarán deshabilitadas
+OPENROUTER_API_KEY=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
+
+# ==========================================
+# FRONTEND
+# ==========================================
+# URL de tu frontend en producción
+FRONTEND_URL=https://vintex.net.br
+
+# ==========================================
+# NOTAS IMPORTANTES
+# ==========================================
+# 1. NO subas este archivo a Git (ya está en .gitignore)
+# 2. Crea un archivo .env.example sin valores reales para el repositorio
+# 3. Las variables marcadas como "Opcional" no romperán el sistema si faltan
+# 4. Todas las demás variables son OBLIGATORIAS
