@@ -1,6 +1,5 @@
 .env
 .env.local
-service-account.json
 .history/
 
 # Dependencias de Node
