@@ -1,6 +1,15 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno y secretos
 .env
 .env.local
-.history/
+.env.*
 
-# Dependencias de Node
-node_modules/
+# Credenciales de Google
+service-account.json
+*.json
+
+# Logs y basura del sistema
+*.log
+.DS_Store
