@@ -9,11 +9,7 @@ const stream = require('stream');
 const app = express();
 const port = process.env.PORT || 4001;
 
-console.log("---------------------------------------------------------");
-console.log("🛠️  INICIANDO SERVIDOR VINTEX BACKEND - MODO DEBUG 🛠️");
-console.log("---------------------------------------------------------");
-
-// --- 1. CONFIGURACIÓN CORS ---
+// --- CONFIGURACIÓN CORS ---
 const allowedOrigins = [
   'http://localhost:5173',
   'https://vintex.net.br',
@@ -22,329 +18,394 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin) {
-        console.log(`🌍 [CORS] Petición sin origen (posiblemente local/postman): Aceptada`);
-        return callback(null, true);
-    }
+    if (!origin) return callback(null, true);
     if (allowedOrigins.indexOf(origin) !== -1) {
-      console.log(`🌍 [CORS] Origen permitido: ${origin}`);
       return callback(null, true);
     }
-    console.log(`⚠️ [CORS] Origen NO explícito, pero aceptando en modo permisivo: ${origin}`);
-    return callback(null, true); // Modo permisivo
+    return callback(null, true);
   },
   credentials: true
 }));
 
 app.use(express.json({ limit: '50mb' }));
 
-// --- LOGGER GENERAL DE PETICIONES ---
-app.use((req, res, next) => {
-    console.log(`\n📥 [REQUEST] ${req.method} ${req.url}`);
-    if (Object.keys(req.body).length > 0) console.log(`   📦 Body:`, JSON.stringify(req.body, null, 2));
-    if (Object.keys(req.query).length > 0) console.log(`   🔍 Query:`, JSON.stringify(req.query, null, 2));
-    next();
-});
-
-// --- 2. CONEXIÓN SUPABASE ---
-console.log("🔌 [INIT] Conectando a Supabase...");
+// --- CONEXIÓN SUPABASE ---
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
-console.log("✅ [INIT] Cliente Supabase Inicializado");
 
-// --- 3. CONEXIÓN GOOGLE DRIVE ---
+// --- CONEXIÓN GOOGLE DRIVE ---
 let drive;
 try {
-  console.log("🔌 [INIT] Conectando a Google Drive...");
   const auth = new google.auth.GoogleAuth({
     keyFile: 'service-account.json',
     scopes: ['https://www.googleapis.com/auth/drive'],
   });
   drive = google.drive({ version: 'v3', auth });
-  console.log("✅ [INIT] Google Drive Conectado Correctamente");
+  console.log("✅ [INIT] Google Drive Conectado");
 } catch (error) {
-  console.error("❌ [INIT ERROR] Falló conexión a Drive:", error.message);
+  console.error("❌ [INIT ERROR] Drive no disponible:", error.message);
 }
 
-const upload = multer({ 
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+const upload = multer({ storage: multer.memoryStorage() });
+
+// --- MIDDLEWARES DE SEGURIDAD ---
+
+// 1. Verifica Token y Carga Perfil del Staff
+const verifyUser = async (req, res, next) => {
+  const token = req.headers['authorization']?.split(' ')[1]; // Bearer TOKEN
+  
+  // MODO DESARROLLO / BYPASS (Si no hay token o falla, usamos un admin por defecto para pruebas)
+  // EN PRODUCCIÓN: Debes validar el token real con supabase.auth.getUser(token)
+  if (!token) {
+      console.log("⚠️ [AUTH] Sin token, usando modo Bypass Admin");
+      req.user = { id: 'admin-bypass', email: 'admin@test.com' };
+      req.staffProfile = { rol: 'admin', sede: 'Catamarca' }; // Asume admin por defecto en dev
+      return next();
+  }
+
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) throw new Error("Token inválido");
+
+    // Buscar perfil en tabla staff
+    const { data: profile } = await supabase
+        .from('perfil_staff')
+        .select('*')
+        .eq('email', user.email)
+        .single();
+
+    req.user = user;
+    req.staffProfile = profile || { rol: null, sede: null };
+    next();
+  } catch (err) {
+    console.error("Auth Error:", err.message);
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+};
+
+// 2. Solo Admins
+const requireAdmin = (req, res, next) => {
+    if (req.staffProfile?.rol === 'admin') return next();
+    return res.status(403).json({ error: 'Requiere acceso Admin' });
+};
+
+// ==========================================
+//           RUTAS DE AUTENTICACIÓN
+// ==========================================
+
+// Login Email/Pass
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({ email, password });
+    if (authError) return res.status(401).json({ error: 'Credenciales inválidas' });
+
+    const { data: profile } = await supabase.from('perfil_staff').select('*').eq('email', email).single();
+
+    res.json({
+      success: true,
+      token: authData.session.access_token,
+      user: {
+        id: authData.user.id,
+        email: authData.user.email,
+        rol: profile?.rol || null,
+        sede: profile?.sede || null,
+        nombre: profile?.nombre || 'Usuario'
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Error interno' });
+  }
 });
 
-// --- MIDDLEWARES ---
-const verifyToken = (req, res, next) => {
-  console.log("🛡️  [AUTH] Verificando Token...");
-  // SIEMPRE LOGUEAR ESTO PARA VERIFICAR SI LLEGA EL HEADER
-  // const authHeader = req.headers['authorization'];
-  // console.log("   🔑 Header recibido:", authHeader ? "SI" : "NO");
-  
-  // MOCK ACTUAL (Pasa siempre)
-  req.user = { email: 'admin@sistema.com' }; 
-  console.log("   🔓 [AUTH] Token aceptado (Bypass activo)");
-  next();
-};
+// Registro Email/Pass
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, nombre, sede } = req.body;
+    const { data: authData, error: authError } = await supabase.auth.signUp({ email, password });
+    
+    if (authError) return res.status(400).json({ error: authError.message });
 
-const bypassAuth = (req, res, next) => {
-  console.log("🛡️  [AUTH] Bypass Total activado para esta ruta");
-  req.user = { email: 'admin@sistema.com' };
-  req.staffProfile = { rol: 'admin', sede: 'Catamarca' };
-  next();
-};
+    // Crear perfil con ROL NULL por defecto (esperando aprobación)
+    await supabase.from('perfil_staff').insert([{
+        email, 
+        nombre: nombre || email.split('@')[0],
+        rol: null, 
+        sede: null, // Sede null hasta que el admin la asigne
+        master_user_id: authData.user.id
+    }]);
 
+    res.status(201).json({ success: true, message: 'Usuario registrado. Espera aprobación.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Error registro' });
+  }
+});
+
+// Sincronización Google
+app.post('/api/auth/google-sync', async (req, res) => {
+    try {
+        const { email, uuid } = req.body;
+        let { data: profile } = await supabase.from('perfil_staff').select('*').eq('email', email).single();
+
+        if (!profile) {
+            const { data: newProfile } = await supabase.from('perfil_staff').insert([{
+                email,
+                nombre: email.split('@')[0],
+                rol: null, // Sin rol inicial
+                sede: null,
+                master_user_id: uuid
+            }]).select().single();
+            profile = newProfile;
+        }
+
+        res.json({
+            success: true,
+            user: {
+                id: uuid,
+                email,
+                rol: profile.rol,
+                sede: profile.sede,
+                nombre: profile.nombre
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ error: "Error sync Google" });
+    }
+});
 
 // ==========================================
-//              RUTAS API
+//           RUTAS DE ALUMNOS (STUDENTS)
 // ==========================================
 
-// --- 1. OBTENER ALUMNOS (Tabla 'student') ---
-app.get('/api/students', verifyToken, async (req, res) => {
+app.get('/api/students', verifyUser, async (req, res) => {
   try {
     const { search, page = 1 } = req.query;
-    console.log(`🔎 [DB] Buscando alumnos. Pagina: ${page}, Filtro: '${search || "NINGUNO"}'`);
-
-    const limit = 50;
-    const from = (page - 1) * limit;
+    const { rol, sede } = req.staffProfile;
+    const limit = 50; 
+    const from = (page - 1) * limit; 
     const to = from + limit - 1;
 
-    let query = supabase
-      .from('student')
-      .select('*', { count: 'exact' });
+    let query = supabase.from('student').select('*', { count: 'exact' });
 
+    // 1. FILTRO POR SEDE (Si no es admin)
+    if (rol !== 'admin' && sede) {
+        query = query.eq('codPuntoKennedy', sede);
+    }
+
+    // 2. BUSQUEDA TEXTUAL
     if (search) {
-      console.log(`   🏗️ [DB] Aplicando filtro ILIKE...`);
       query = query.or(`full_name.ilike.%${search}%,"numero Identificacion".ilike.%${search}%,legdef.ilike.%${search}%`);
     }
 
-    const start = Date.now();
-    const { data, count, error } = await query
-      .order('created_at', { ascending: false })
-      .range(from, to);
-    const end = Date.now();
+    // 3. ORDENAMIENTO INTELIGENTE: Primero los que piden secretaria
+    query = query.order('solicita secretaria', { ascending: false }) // True primero
+                 .order('created_at', { ascending: false });
 
-    if (error) {
-        console.error("❌ [DB ERROR] Error en query 'student':", error);
-        throw error;
-    }
+    const { data, count, error } = await query.range(from, to);
+    if (error) throw error;
 
-    console.log(`✅ [DB] Consulta exitosa en ${end - start}ms. Registros encontrados: ${data.length} (Total: ${count})`);
-
-    // MAPEO DE DATOS
-    const mappedData = data.map(s => ({
+    // Mapeo para el Frontend
+    const mappedData = (data || []).map(s => ({
       id: s.id,
       full_name: s.full_name,
       dni: s['numero Identificacion'],
       legajo: s.legdef,
-      contact_phone: s.telefono1,
-      contact_email: s['correo Personal'],
-      location: s['codPuntoKennedy'] || 'S/D',
-      career_name: s['nombrePrograma'] || 'Sin Programa',
-      status: 'Importado',
-      general_notes: '',
-      bot_students: true,
-      last_interaction_at: s.created_at
+      contact_phone: s.telefono1 || s.telefono2,
+      location: s['codPuntoKennedy'],
+      career_name: s['nombrePrograma'],
+      bot_active: s['bot active'], // Mapeo exacto de columnas
+      solicita_secretaria: s['solicita secretaria'],
+      mood: s.mood || 'Neutro',
+      last_interaction: s.created_at
     }));
 
     res.json({ 
-      data: mappedData, 
-      total: count, 
-      page: parseInt(page), 
-      userRole: 'admin' 
+        data: mappedData, 
+        total: count || 0, 
+        userRole: rol,
+        userSede: sede
     });
 
   } catch (err) {
-    console.error("💥 [SERVER ERROR] GET /api/students:", err.message);
-    res.status(500).json({ error: 'Error obteniendo alumnos' });
+    console.error(err);
+    res.status(500).json({ error: 'Error buscando alumnos' });
   }
 });
 
-// --- 2. DETALLE ALUMNO + DOCUMENTOS (Drive) ---
-app.get('/api/students/:id', verifyToken, async (req, res) => {
-  const { id } = req.params;
-  console.log(`👤 [DB] Buscando detalle alumno ID: ${id}`);
+// Detalle Alumno + Chats + Docs
+app.get('/api/students/:id', verifyUser, async (req, res) => {
+    const { id } = req.params;
+    try {
+        // A. Datos del Alumno
+        const { data: s } = await supabase.from('student').select('*').eq('id', id).single();
+        if (!s) return res.status(404).json({ error: 'No encontrado' });
 
-  try {
-    // A. Buscar Alumno
-    const { data: s, error } = await supabase
-      .from('student')
-      .select('*')
-      .eq('id', id)
-      .single();
-
-    if (error || !s) {
-        console.warn(`⚠️ [DB] Alumno no encontrado o error:`, error);
-        return res.status(404).json({ error: 'Alumno no encontrado' });
-    }
-    console.log(`   ✅ [DB] Alumno encontrado: ${s.full_name}`);
-
-    const student = {
-      id: s.id,
-      full_name: s.full_name,
-      dni: s['numero Identificacion'],
-      legajo: s.legdef,
-      contact_phone: s.telefono1,
-      location: s['codPuntoKennedy'],
-      career_name: s['nombrePrograma'],
-      status: 'Importado',
-      general_notes: ''
-    };
-
-    // B. Buscar Documentos
-    let documents = [];
-    const rawPhone = s.telefono1 || '';
-    const cleanPhone = rawPhone.replace(/\D/g, ''); 
-    console.log(`   📂 [DB] Buscando documentos para teléfono: ${cleanPhone} (Original: ${rawPhone})`);
-
-    if (cleanPhone.length > 5) {
-        const docQuery = await supabase
-            .from('student_documents')
-            .select('*')
-            .eq('student_phone', cleanPhone)
-            .order('uploaded_at', { ascending: false });
+        // B. Historial de Chat (Búsqueda por teléfono)
+        // Limpiamos los teléfonos para buscar coincidencias parciales
+        const p1 = s.telefono1 ? s.telefono1.replace(/\D/g, '') : null;
+        const p2 = s.telefono2 ? s.telefono2.replace(/\D/g, '') : null;
         
-        if (docQuery.error) console.error("   ❌ [DB ERROR] Error buscando documentos:", docQuery.error);
+        let chatHistory = [];
+        if (p1 || p2) {
+            let orQuery = [];
+            if (p1 && p1.length > 5) orQuery.push(`session_id.ilike.%${p1}%`);
+            if (p2 && p2.length > 5) orQuery.push(`session_id.ilike.%${p2}%`);
+            
+            if (orQuery.length > 0) {
+                const { data: chats } = await supabase
+                    .from('n8n_chat_histories')
+                    .select('*')
+                    .or(orQuery.join(','))
+                    .order('id', { ascending: true }); // Orden cronológico
+                
+                // Procesar Mensajes (Parsing JSON)
+                chatHistory = (chats || []).map(c => {
+                    let parsedContent = c.message.content;
+                    let isBot = c.message.type === 'ai';
+                    
+                    // Si es Bot y tiene JSON anidado, extraer mensaje_1, mensaje_2...
+                    if (isBot && typeof parsedContent === 'string' && parsedContent.includes('output')) {
+                        try {
+                            const innerJson = JSON.parse(parsedContent);
+                            if (innerJson.output) {
+                                // Juntamos mensaje 1, 2 y 3 en un solo texto limpio
+                                parsedContent = [
+                                    innerJson.output.mensaje_1,
+                                    innerJson.output.mensaje_2,
+                                    innerJson.output.mensaje_3
+                                ].filter(Boolean).join('\n\n');
+                            }
+                        } catch (e) { /* Fallback si falla parseo */ }
+                    }
+
+                    return {
+                        id: c.id,
+                        role: c.message.type === 'human' ? 'user' : 'assistant',
+                        content: parsedContent,
+                        raw: c.message // Guardamos el raw por si acaso
+                    };
+                });
+            }
+        }
+
+        res.json({ 
+            student: s,
+            chatHistory 
+        });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error cargando detalle' });
+    }
+});
+
+// Acción: "Atendido" (Toggle Solicita Secretaria)
+app.put('/api/students/:id/toggle-help', verifyUser, async (req, res) => {
+    try {
+        // Lógica: Si presiona el botón, es porque ya atendió al alumno.
+        // Pone 'solicita secretaria' en FALSE y reactiva el BOT.
+        const { error } = await supabase
+            .from('student')
+            .update({ 
+                'solicita secretaria': false,
+                'bot active': true 
+            })
+            .eq('id', req.params.id);
+            
+        if (error) throw error;
+        res.json({ success: true, message: 'Alumno atendido. Bot reactivado.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Error actualizando estado' });
+    }
+});
+
+// Acción: Enviar Mensaje (Insertar en tabla para n8n)
+app.post('/api/messages', verifyUser, async (req, res) => {
+    try {
+        const { studentId, messageText, phone } = req.body;
         
-        documents = docQuery.data || [];
-        console.log(`   ✅ [DB] Documentos encontrados: ${documents.length}`);
-    } else {
-        console.log(`   ⚠️ [DB] Teléfono inválido o muy corto, saltando búsqueda de docs.`);
+        // Estructura JSON requerida por n8n
+        const payload = {
+            message: messageText,
+            agent: req.staffProfile.nombre || 'Secretaria'
+        };
+
+        const { error } = await supabase
+            .from('Mensaje_de_secretaria')
+            .insert([{
+                "Telefono_EST": phone,
+                "Mensaje de secretaria": payload
+            }]);
+
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error enviando mensaje' });
     }
-
-    res.json({ student, documents });
-
-  } catch (err) {
-    console.error("💥 [SERVER ERROR] GET /api/students/:id", err);
-    res.status(500).json({ error: 'Error del servidor' });
-  }
 });
 
-// --- 3. SUBIR DOCUMENTO (A Google Drive) ---
-app.post('/api/students/phone/:phone/documents', verifyToken, upload.single('file'), async (req, res) => {
-  const rawPhone = req.params.phone;
-  console.log(`📤 [UPLOAD] Iniciando carga de archivo para teléfono: ${rawPhone}`);
+// ==========================================
+//           RUTAS DE CARRERAS
+// ==========================================
+app.get('/api/careers', verifyUser, async (req, res) => {
+    const { data } = await supabase.from('resumen_carreras').select('*').order('CARRERA');
+    res.json(data || []);
+});
 
-  try {
-    if (!drive) {
-        console.error("❌ [DRIVE] El servicio de Drive no está inicializado.");
-        return res.status(503).json({ error: 'Drive no disponible' });
-    }
+// ==========================================
+//           GESTIÓN DE EQUIPO (STAFF)
+// ==========================================
+
+// Listar pendientes o todo el equipo (Solo Admin/Asesor)
+app.get('/api/staff', verifyUser, async (req, res) => {
+    const { rol, sede } = req.staffProfile;
     
-    const cleanPhone = rawPhone.replace(/\D/g, '');
-    const { documentType } = req.body;
-    const file = req.file;
+    let query = supabase.from('perfil_staff').select('*');
 
-    if (!file) {
-        console.error("❌ [UPLOAD] No se recibió ningún archivo en el body.");
-        return res.status(400).json({ error: 'Falta archivo' });
+    // Si es Asesor, solo ve gente de su sede o gente sin sede (para aprobar)
+    if (rol === 'asesor') {
+        // Lógica: Asesor ve los de su sede y los NULL (pendientes)
+        // Supabase no tiene OR simple entre columnas y nulos facil, simplificamos:
+        // El asesor verá todos y filtraremos en backend o solo los NULL.
+        // Para simplificar: Asesor solo ve pendientes (rol is null).
+        query = query.is('rol', null); 
+    } else if (rol !== 'admin') {
+        return res.status(403).json({ error: 'Acceso denegado' });
     }
 
-    console.log(`   📄 Archivo: ${file.originalname} (${file.mimetype}) - Tipo: ${documentType}`);
+    const { data } = await query.order('created_at', { ascending: false });
+    res.json(data || []);
+});
 
-    // 1. Subir a Google Drive
-    console.log(`   ☁️ [DRIVE] Subiendo stream a Google Drive...`);
-    const fileMetadata = {
-      name: `${cleanPhone}_${documentType}_${file.originalname}`,
-      parents: [process.env.GOOGLE_DRIVE_FOLDER_ID],
-    };
-    const media = {
-      mimeType: file.mimetype,
-      body: stream.Readable.from(file.buffer),
-    };
+// Aprobar/Editar Staff
+app.put('/api/staff/:id', verifyUser, async (req, res) => {
+    const { id } = req.params;
+    const { newRole, newSede } = req.body; // Lo que se quiere asignar
+    const currentUser = req.staffProfile;
 
-    const driveResponse = await drive.files.create({
-      resource: fileMetadata,
-      media: media,
-      fields: 'id',
-    });
-    console.log(`   ✅ [DRIVE] Archivo subido. ID Google: ${driveResponse.data.id}`);
+    try {
+        // Validaciones de permisos
+        if (currentUser.rol === 'admin') {
+            // Admin puede hacer todo
+            await supabase.from('perfil_staff').update({ rol: newRole, sede: newSede }).eq('id', id);
+        } else if (currentUser.rol === 'asesor') {
+            // Asesor solo puede asignar rol 'secretaria' y SU propia sede
+            if (newRole !== 'secretaria') return res.status(403).json({ error: 'Solo puedes asignar Secretarias' });
+            await supabase.from('perfil_staff').update({ rol: 'secretaria', sede: currentUser.sede }).eq('id', id);
+        } else {
+            return res.status(403).json({ error: 'No tienes permisos' });
+        }
 
-    // 2. Guardar referencia en Supabase
-    console.log(`   💾 [DB] Guardando referencia en tabla 'student_documents'...`);
-    const { data, error } = await supabase
-      .from('student_documents')
-      .insert([{
-        student_phone: cleanPhone,
-        document_type: documentType,
-        drive_file_id: driveResponse.data.id, 
-        file_name: file.originalname,
-        mime_type: file.mimetype,
-        uploaded_at: new Date()
-      }])
-      .select()
-      .single();
-
-    if (error) {
-        console.error("   ❌ [DB ERROR] Falló al guardar referencia:", error);
-        throw error;
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: 'Error actualizando staff' });
     }
-
-    console.log(`   ✅ [DB] Referencia guardada ID: ${data.id}`);
-    res.json({ success: true, message: 'Subido a Drive', id: data.id });
-
-  } catch (err) {
-    console.error("💥 [SERVER ERROR] Upload failed:", err);
-    res.status(500).json({ error: 'Error al subir archivo' });
-  }
 });
 
-// --- 4. DESCARGAR DOCUMENTO (Desde Drive) ---
-app.get('/api/documents/:id/download', verifyToken, async (req, res) => {
-  const docId = req.params.id;
-  console.log(`⬇️ [DOWNLOAD] Solicitud de descarga doc ID: ${docId}`);
 
-  try {
-    if (!drive) return res.status(503).json({ error: 'Drive no disponible' });
-
-    // 1. Obtener ID de Drive desde Supabase
-    const { data: doc, error } = await supabase
-      .from('student_documents')
-      .select('*')
-      .eq('id', docId)
-      .single();
-
-    if (error || !doc) {
-        console.error("❌ [DB] Documento no encontrado en base de datos.");
-        return res.status(404).json({ error: 'Documento no encontrado' });
-    }
-    
-    console.log(`   ✅ [DB] Metadata encontrada. Drive File ID: ${doc.drive_file_id}`);
-    console.log(`   ☁️ [DRIVE] Obteniendo stream del archivo...`);
-
-    // 2. Pedir stream a Google Drive
-    const driveStream = await drive.files.get(
-      { fileId: doc.drive_file_id, alt: 'media' },
-      { responseType: 'stream' }
-    );
-
-    res.setHeader('Content-Disposition', `attachment; filename="${doc.file_name}"`);
-    res.setHeader('Content-Type', doc.mime_type);
-    
-    driveStream.data.pipe(res);
-    console.log(`   ✅ [DOWNLOAD] Stream enviado al cliente.`);
-
-  } catch (err) {
-    console.error("💥 [SERVER ERROR] Download failed:", err.message);
-    res.status(500).json({ error: 'Error en descarga' });
-  }
-});
-
-// --- 5. OTRAS RUTAS ---
-app.get('/api/bot', bypassAuth, async (req, res) => {
-  console.log("🤖 [BOT] Consultando configuraciones...");
-  const { data } = await supabase.from('bot_settings').select('*').single();
-  res.json(data || {});
-});
-
-app.get('/api/careers', async (req, res) => {
-    console.log("📚 [API] Consultando carreras (Mock vacío)");
-    res.json([]); 
-});
-
-// --- ARRANQUE ---
-app.listen(port, () => {
-  console.log(`\n🚀 KENNEDY BACKEND (Supabase + G-Drive) ESCUCHANDO EN PUERTO ${port}`);
-  console.log(`   ➜ Local: http://localhost:${port}`);
-  console.log("---------------------------------------------------------");
-});
+// Arrancar
+app.listen(port, () => console.log(`🚀 KENNEDY BACKEND v4.0 corriendo en puerto ${port}`));
