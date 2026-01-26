@@ -5,6 +5,9 @@ const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const { google } = require('googleapis');
 const stream = require('stream');
+// IA LIBS
+const OpenAI = require('openai');
+const pdf = require('pdf-parse'); 
 
 const app = express();
 const port = process.env.PORT || 4001;
@@ -13,7 +16,7 @@ const port = process.env.PORT || 4001;
 // 1. CONFIGURACIÓN INICIAL
 // ==========================================
 
-// --- CORS (Permitir conexiones) ---
+// --- CORS ---
 const allowedOrigins = [
   'http://localhost:5173',
   'https://vintex.net.br',
@@ -53,6 +56,12 @@ try {
   console.error("❌ [INIT ERROR] Drive no disponible:", error.message);
 }
 
+// --- CONEXIÓN IA (OPENROUTER) ---
+const openai = new OpenAI({
+  baseURL: "https://openrouter.ai/api/v1",
+  apiKey: process.env.OPENROUTER_API_KEY, 
+});
+
 const upload = multer({ 
     storage: multer.memoryStorage(),
     limits: { fileSize: 10 * 1024 * 1024 } // 10MB
@@ -63,9 +72,8 @@ const upload = multer({
 // ==========================================
 
 const verifyUser = async (req, res, next) => {
-  const token = req.headers['authorization']?.split(' ')[1]; // Bearer TOKEN
+  const token = req.headers['authorization']?.split(' ')[1]; 
   
-  // MODO DESARROLLO / BYPASS (Si no hay token o falla, usamos un admin por defecto para pruebas)
   if (!token) {
       console.log("⚠️ [AUTH] Sin token, usando modo Bypass Admin");
       req.user = { id: 'admin-bypass', email: 'admin@test.com' };
@@ -77,7 +85,6 @@ const verifyUser = async (req, res, next) => {
     const { data: { user }, error } = await supabase.auth.getUser(token);
     if (error || !user) throw new Error("Token inválido");
 
-    // Buscar perfil en tabla staff
     const { data: profile } = await supabase
         .from('perfil_staff')
         .select('*')
@@ -97,7 +104,6 @@ const verifyUser = async (req, res, next) => {
 // 3. RUTAS DE AUTENTICACIÓN
 // ==========================================
 
-// Login Email/Password
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -120,14 +126,12 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Error interno' }); }
 });
 
-// Registro Email/Password
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, nombre, sede } = req.body;
     const { data: authData, error: authError } = await supabase.auth.signUp({ email, password });
     if (authError) return res.status(400).json({ error: authError.message });
 
-    // Crear perfil con ROL NULL (pendiente de aprobación)
     await supabase.from('perfil_staff').insert([{
         email, 
         nombre: nombre || email.split('@')[0], 
@@ -140,7 +144,6 @@ app.post('/api/auth/register', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Error registro' }); }
 });
 
-// Sincronización Login con Google
 app.post('/api/auth/google-sync', async (req, res) => {
     try {
         const { email, uuid } = req.body;
@@ -172,7 +175,6 @@ app.post('/api/auth/google-sync', async (req, res) => {
 // 4. GESTIÓN DE ALUMNOS (STUDENTS)
 // ==========================================
 
-// Obtener Lista de Alumnos (Con filtros y orden)
 app.get('/api/students', verifyUser, async (req, res) => {
   try {
     const { search, page = 1 } = req.query;
@@ -183,16 +185,13 @@ app.get('/api/students', verifyUser, async (req, res) => {
 
     let query = supabase.from('student').select('*', { count: 'exact' });
 
-    // Filtro por Sede (si no es admin)
     if (rol !== 'admin' && sede) {
         query = query.eq('codPuntoKennedy', sede);
     }
-    // Búsqueda
     if (search) {
       query = query.or(`full_name.ilike.%${search}%,"numero Identificacion".ilike.%${search}%,legdef.ilike.%${search}%`);
     }
 
-    // Ordenamiento: Primero los que solicitan secretaria
     query = query.order('solicita secretaria', { ascending: false })
                  .order('created_at', { ascending: false });
 
@@ -218,14 +217,12 @@ app.get('/api/students', verifyUser, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Error buscando alumnos' }); }
 });
 
-// Obtener Detalle de Alumno + Chats
 app.get('/api/students/:id', verifyUser, async (req, res) => {
     const { id } = req.params;
     try {
         const { data: s } = await supabase.from('student').select('*').eq('id', id).single();
         if (!s) return res.status(404).json({ error: 'No encontrado' });
 
-        // Historial de Chat
         const p1 = s.telefono1 ? s.telefono1.replace(/\D/g, '') : null;
         const p2 = s.telefono2 ? s.telefono2.replace(/\D/g, '') : null;
         let chatHistory = [];
@@ -246,7 +243,6 @@ app.get('/api/students/:id', verifyUser, async (req, res) => {
                     let parsedContent = c.message.content;
                     let isBot = c.message.type === 'ai';
                     
-                    // Lógica para extraer mensajes limpios del JSON del bot
                     if (isBot && typeof parsedContent === 'string' && parsedContent.includes('output')) {
                         try {
                             const innerJson = JSON.parse(parsedContent);
@@ -264,7 +260,6 @@ app.get('/api/students/:id', verifyUser, async (req, res) => {
             }
         }
         
-        // Documentos (Archivos)
         let documents = [];
         const docPhone = p1 || p2;
         if (docPhone && docPhone.length > 5) {
@@ -280,7 +275,6 @@ app.get('/api/students/:id', verifyUser, async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Error cargando detalle' }); }
 });
 
-// Actualizar Alumno (Status, Bot Active, Mood, Solicita Secretaria)
 app.patch('/api/students/:id', verifyUser, async (req, res) => {
     const { id } = req.params;
     const { status, bot_active, solicita_secretaria, mood } = req.body;
@@ -300,7 +294,6 @@ app.patch('/api/students/:id', verifyUser, async (req, res) => {
         if (error) throw error;
         res.json({ success: true });
     } catch (err) {
-        console.error(err);
         res.status(500).json({ error: 'Error actualizando alumno' });
     }
 });
@@ -309,7 +302,6 @@ app.patch('/api/students/:id', verifyUser, async (req, res) => {
 // 5. SISTEMA DE ARCHIVOS (GOOGLE DRIVE)
 // ==========================================
 
-// Subir Archivo
 app.post('/api/students/phone/:phone/documents', verifyUser, upload.single('file'), async (req, res) => {
   const rawPhone = req.params.phone;
   try {
@@ -320,7 +312,6 @@ app.post('/api/students/phone/:phone/documents', verifyUser, upload.single('file
 
     if (!file) return res.status(400).json({ error: 'Falta archivo' });
 
-    // 1. Subir a Google Drive
     const fileMetadata = {
       name: `${cleanPhone}_${documentType}_${file.originalname}`,
       parents: [process.env.GOOGLE_DRIVE_FOLDER_ID],
@@ -336,7 +327,6 @@ app.post('/api/students/phone/:phone/documents', verifyUser, upload.single('file
       fields: 'id',
     });
 
-    // 2. Guardar referencia en Supabase
     const { data, error } = await supabase
       .from('student_documents')
       .insert([{
@@ -354,18 +344,15 @@ app.post('/api/students/phone/:phone/documents', verifyUser, upload.single('file
     res.json({ success: true, message: 'Subido a Drive', id: data.id });
 
   } catch (err) {
-    console.error("Upload failed:", err);
     res.status(500).json({ error: 'Error al subir archivo' });
   }
 });
 
-// Descargar Archivo
 app.get('/api/documents/:id/download', verifyUser, async (req, res) => {
   const docId = req.params.id;
   try {
     if (!drive) return res.status(503).json({ error: 'Drive no disponible' });
 
-    // 1. Obtener ID de Drive desde Supabase
     const { data: doc, error } = await supabase
       .from('student_documents')
       .select('*')
@@ -374,7 +361,6 @@ app.get('/api/documents/:id/download', verifyUser, async (req, res) => {
 
     if (error || !doc) return res.status(404).json({ error: 'Documento no encontrado' });
 
-    // 2. Stream desde Drive
     const driveStream = await drive.files.get(
       { fileId: doc.drive_file_id, alt: 'media' },
       { responseType: 'stream' }
@@ -385,21 +371,18 @@ app.get('/api/documents/:id/download', verifyUser, async (req, res) => {
     
     driveStream.data.pipe(res);
   } catch (err) {
-    console.error("Download failed:", err);
     res.status(500).json({ error: 'Error en descarga' });
   }
 });
 
 // ==========================================
-// 6. MENSAJERÍA Y OTROS
+// 6. MENSAJERÍA MANUAL
 // ==========================================
 
-// Enviar Mensaje Manual (Guarda Sede)
 app.post('/api/messages', verifyUser, async (req, res) => {
     try {
         const { studentId, messageText, phone } = req.body;
         
-        // 1. Obtener la SEDE del estudiante
         const { data: student, error: stError } = await supabase
             .from('student')
             .select('codPuntoKennedy')
@@ -408,13 +391,11 @@ app.post('/api/messages', verifyUser, async (req, res) => {
 
         if (stError) throw new Error("Estudiante no encontrado");
 
-        // 2. Payload para n8n
         const payload = {
             message: messageText,
             agent: req.staffProfile.nombre || 'Secretaria'
         };
 
-        // 3. Insertar con SEDE
         const { error } = await supabase
             .from('Mensaje_de_secretaria')
             .insert([{
@@ -426,29 +407,24 @@ app.post('/api/messages', verifyUser, async (req, res) => {
         if (error) throw error;
         res.json({ success: true });
     } catch (err) {
-        console.error(err);
         res.status(500).json({ error: 'Error enviando mensaje' });
     }
 });
 
-// Listar Carreras
+// ==========================================
+// 7. GESTIÓN DE STAFF Y CARRERAS
+// ==========================================
+
 app.get('/api/careers', verifyUser, async (req, res) => {
     const { data } = await supabase.from('resumen_carreras').select('*').order('CARRERA');
     res.json(data || []);
 });
 
-// ==========================================
-// 7. GESTIÓN DE STAFF
-// ==========================================
-
-// Listar Staff (Admin ve todo, Asesor solo pendientes/su sede)
 app.get('/api/staff', verifyUser, async (req, res) => {
     const { rol } = req.staffProfile;
     let query = supabase.from('perfil_staff').select('*');
     
     if (rol === 'asesor') {
-        // Asesor solo ve gente SIN rol (para aprobar) o de SU sede (opcional)
-        // Por simplicidad, dejamos que vea los pendientes.
         query = query.is('rol', null); 
     } else if (rol !== 'admin') {
         return res.status(403).json({ error: 'Acceso denegado' });
@@ -458,7 +434,6 @@ app.get('/api/staff', verifyUser, async (req, res) => {
     res.json(data || []);
 });
 
-// Aprobar/Modificar Staff
 app.put('/api/staff/:id', verifyUser, async (req, res) => {
     const { id } = req.params;
     const { newRole, newSede } = req.body;
@@ -469,7 +444,6 @@ app.put('/api/staff/:id', verifyUser, async (req, res) => {
             await supabase.from('perfil_staff').update({ rol: newRole, sede: newSede }).eq('id', id);
         } else if (currentUser.rol === 'asesor') {
             if (newRole !== 'secretaria') return res.status(403).json({ error: 'Solo puedes asignar Secretarias' });
-            // Asesor asigna secretaria a SU propia sede forzosamente
             await supabase.from('perfil_staff').update({ rol: 'secretaria', sede: currentUser.sede }).eq('id', id);
         } else {
             return res.status(403).json({ error: 'No tienes permisos' });
@@ -478,5 +452,134 @@ app.put('/api/staff/:id', verifyUser, async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Error actualizando staff' }); }
 });
 
+// ==========================================
+// 8. BOT ANALISTA (RAG / INTELIGENCIA)
+// ==========================================
+
+// Función Auxiliar: Leer Historial Reciente
+async function nodeReadChat(studentId) {
+    const { data: student } = await supabase.from('student').select('telefono1, telefono2').eq('id', studentId).single();
+    if (!student) return "Sin historial.";
+
+    const p1 = student.telefono1 ? student.telefono1.replace(/\D/g, '') : 'X';
+    const p2 = student.telefono2 ? student.telefono2.replace(/\D/g, '') : 'X';
+
+    const { data: chats } = await supabase
+        .from('n8n_chat_histories')
+        .select('message')
+        .or(`session_id.ilike.%${p1}%,session_id.ilike.%${p2}%`)
+        .order('id', { ascending: false }) 
+        .limit(20);
+
+    if (!chats || chats.length === 0) return "No hay historial de chat reciente.";
+
+    return chats.map(c => {
+        const msg = c.message;
+        const role = msg.type === 'human' ? 'Alumno' : 'Bot';
+        let content = msg.content;
+        if (typeof content === 'string' && content.includes('output')) {
+             try { content = JSON.parse(content).output.mensaje_1 || content; } catch(e){}
+        }
+        return `${role}: ${content}`;
+    }).reverse().join('\n');
+}
+
+// Función Auxiliar: Leer Documentos de Drive
+async function nodeReadDrive(studentId) {
+    // 1. Obtener Teléfonos para buscar en tabla student_documents
+    const { data: student } = await supabase.from('student').select('telefono1, telefono2').eq('id', studentId).single();
+    const p1 = student.telefono1 ? student.telefono1.replace(/\D/g, '') : 'X';
+    const p2 = student.telefono2 ? student.telefono2.replace(/\D/g, '') : 'X';
+
+    const { data: docs } = await supabase
+        .from('student_documents')
+        .select('*')
+        .or(`student_phone.eq.${p1},student_phone.eq.${p2}`);
+
+    if (!docs || docs.length === 0) return "No hay documentos cargados.";
+
+    let documentsContent = "";
+
+    for (const doc of docs) {
+        try {
+            if(!drive) continue;
+            console.log(`📄 Analizando archivo: ${doc.file_name}`);
+            
+            const response = await drive.files.get(
+                { fileId: doc.drive_file_id, alt: 'media' },
+                { responseType: 'arraybuffer' }
+            );
+            
+            const buffer = Buffer.from(response.data);
+            let text = "";
+
+            if (doc.mime_type === 'application/pdf') {
+                const pdfData = await pdf(buffer);
+                text = pdfData.text;
+            } else if (doc.mime_type.includes('text') || doc.mime_type.includes('json')) {
+                text = buffer.toString('utf-8');
+            } else {
+                text = "[Archivo de imagen o formato no legible]";
+            }
+            documentsContent += `\n--- DOC: ${doc.document_type} ---\n${text.substring(0, 1500)}...\n`;
+        } catch (err) {
+            console.error(`Error leyendo ${doc.file_name}:`, err.message);
+        }
+    }
+    return documentsContent;
+}
+
+// Endpoint del Bot
+app.post('/api/bot/analyze', verifyUser, async (req, res) => {
+    const { studentId, question } = req.body;
+    console.log(`🤖 [BOT] Analizando alumno ${studentId}... Pregunta: ${question}`);
+
+    try {
+        const { data: student } = await supabase.from('student').select('*').eq('id', studentId).single();
+        
+        // Ejecución Paralela de Nodos
+        const [chatContext, docsContext] = await Promise.all([
+            nodeReadChat(studentId),
+            nodeReadDrive(studentId)
+        ]);
+
+        const prompt = `
+        ACTÚA COMO: Un asistente experto de la secretaría académica de la Universidad Kennedy.
+        TU OBJETIVO: Responder la pregunta de la secretaria basándote E STRICTAMENTE en la información proporcionada.
+
+        --- PERFIL DEL ALUMNO ---
+        Nombre: ${student.full_name}
+        DNI: ${student['numero Identificacion']}
+        Carrera: ${student['nombrePrograma']}
+        Estado: ${student.status}
+        Sede: ${student['codPuntoKennedy']}
+
+        --- HISTORIAL DE CHAT RECIENTE ---
+        ${chatContext}
+
+        --- CONTENIDO DE DOCUMENTOS EN DRIVE ---
+        ${docsContext}
+
+        --- PREGUNTA DE LA SECRETARIA ---
+        ${question}
+
+        RESPUESTA (Sé conciso, profesional y cita la fuente si viene de un documento o del chat):
+        `;
+
+        const completion = await openai.chat.completions.create({
+            model: "meta-llama/llama-3.3-70b-instruct:free", 
+            messages: [{ role: "user", content: prompt }],
+        });
+
+        const answer = completion.choices[0].message.content;
+        res.json({ answer });
+
+    } catch (err) {
+        console.error("Bot Error:", err);
+        res.status(500).json({ error: 'Error al procesar con la IA' });
+    }
+});
+
+
 // --- ARRANQUE ---
-app.listen(port, () => console.log(`🚀 KENNEDY BACKEND FULL v6.0 corriendo en puerto ${port}`));
+app.listen(port, () => console.log(`🚀 KENNEDY BACKEND FULL v7.0 (AI + Drive) en puerto ${port}`));
