@@ -92,7 +92,6 @@ const verifyUser = async (req, res, next) => {
         .eq('email', user.email)
         .single();
 
-    // SI EL USUARIO NO TIENE ROL (Null) O NO EXISTE PERFIL, BLOQUEAMOS
     if (!profile || !profile.rol) {
         return res.status(403).json({ error: 'Tu cuenta está inactiva o sin rol asignado.' });
     }
@@ -181,15 +180,14 @@ app.post('/api/auth/google-sync', async (req, res) => {
 // 4. GESTIÓN ALUMNOS
 // ==========================================
 
-// CREAR ALUMNO (POST) - Nuevo requisito
+// CREAR ALUMNO (POST)
 app.post('/api/students', verifyUser, async (req, res) => {
     const { rol } = req.staffProfile;
-    // Solo Admin y Asesor pueden crear
     if (rol !== 'admin' && rol !== 'asesor') return res.status(403).json({ error: 'No tienes permisos para crear alumnos' });
 
     try {
         const newStudent = req.body; 
-        delete newStudent.id; // Postgres genera el ID
+        delete newStudent.id; 
         
         const { data, error } = await supabase.from('student').insert([newStudent]).select();
         if (error) throw error;
@@ -243,14 +241,13 @@ app.get('/api/students', verifyUser, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Error buscando alumnos' }); }
 });
 
-// DETALLE DE UN ALUMNO
+// DETALLE DE UN ALUMNO (CORREGIDO PARSEO)
 app.get('/api/students/:id', verifyUser, async (req, res) => {
     const { id } = req.params;
     try {
         const { data: s } = await supabase.from('student').select('*').eq('id', id).single();
         if (!s) return res.status(404).json({ error: 'No encontrado' });
 
-        // --- CHAT HISTORY ---
         const p1 = s.telefono1 ? s.telefono1.replace(/\D/g, '') : null;
         const p2 = s.telefono2 ? s.telefono2.replace(/\D/g, '') : null;
         let chatHistory = [];
@@ -268,12 +265,26 @@ app.get('/api/students/:id', verifyUser, async (req, res) => {
                     .order('id', { ascending: true });
                 
                 chatHistory = (chats || []).map(c => {
-                    let parsedContent = c.message.content;
+                    let rawMsg = c.message;
+                    // Intenta parsear si es string
+                    if (typeof rawMsg === 'string') {
+                        try { rawMsg = JSON.parse(rawMsg); } catch (e) {
+                            return { id: c.id, role: 'system', content: c.message };
+                        }
+                    }
+
+                    const role = rawMsg.type === 'human' ? 'user' : 'assistant';
+                    let content = rawMsg.content;
+
+                    // Limpieza profunda de output de agentes
                     try {
-                        if (typeof parsedContent === 'string' && parsedContent.includes('output')) {
-                            const innerJson = JSON.parse(parsedContent);
-                            if (innerJson.output) {
-                                parsedContent = [
+                        if (typeof content === 'string' && (content.includes('output') || content.trim().startsWith('{'))) {
+                            const innerJson = JSON.parse(content);
+                            if (innerJson.output && innerJson.output.message) {
+                                content = innerJson.output.message;
+                            } else if (innerJson.output) {
+                                content = [
+                                    innerJson.output.message,
                                     innerJson.output.mensaje_1, 
                                     innerJson.output.mensaje_2, 
                                     innerJson.output.mensaje_3
@@ -281,12 +292,12 @@ app.get('/api/students/:id', verifyUser, async (req, res) => {
                             }
                         }
                     } catch (e) { }
-                    return { id: c.id, role: c.message.type === 'human' ? 'user' : 'assistant', content: parsedContent };
+
+                    return { id: c.id, role, content };
                 });
             }
         }
         
-        // --- DOCUMENTOS ---
         const { data: docs } = await supabase
             .from('student_documents')
             .select('*')
@@ -294,10 +305,13 @@ app.get('/api/students/:id', verifyUser, async (req, res) => {
             .order('uploaded_at', { ascending: false });
 
         res.json({ student: s, chatHistory, documents: docs || [] });
-    } catch (err) { res.status(500).json({ error: 'Error cargando detalle' }); }
+    } catch (err) { 
+        console.error(err);
+        res.status(500).json({ error: 'Error cargando detalle' }); 
+    }
 });
 
-// ACTUALIZAR ALUMNO (PATCH) - Soporte Completo
+// ACTUALIZAR ALUMNO (PATCH)
 app.patch('/api/students/:id', verifyUser, async (req, res) => {
     const { id } = req.params;
     const body = req.body;
@@ -305,7 +319,7 @@ app.patch('/api/students/:id', verifyUser, async (req, res) => {
     try {
         const { error } = await supabase
             .from('student')
-            .update(body) // Ahora actualizamos directamente con lo que envía el frontend (ya mapeado)
+            .update(body) 
             .eq('id', id);
 
         if (error) throw error;
@@ -318,34 +332,65 @@ app.patch('/api/students/:id', verifyUser, async (req, res) => {
 });
 
 // ==========================================
-// 5. CARRERAS
+// 5. CARRERAS (NUEVOS ENDPOINTS)
 // ==========================================
 
 app.get('/api/careers', verifyUser, async (req, res) => {
-    // Retorna TODOS los campos de la tabla resumen_carreras
     const { data } = await supabase.from('resumen_carreras').select('*').order('CARRERA');
     res.json(data || []);
 });
 
-// EDITAR CARRERA (PUT) - Nuevo
+// CREAR CARRERA (SOLO ADMIN)
+app.post('/api/careers', verifyUser, async (req, res) => {
+    const { rol } = req.staffProfile;
+    if (rol !== 'admin') return res.status(403).json({ error: 'Acceso denegado: Solo administradores pueden crear carreras.' });
+
+    try {
+        const newCareer = req.body;
+        delete newCareer.id; 
+        delete newCareer.created_at;
+
+        const { data, error } = await supabase.from('resumen_carreras').insert([newCareer]).select();
+        
+        if (error) throw error;
+        res.json({ success: true, data });
+    } catch (err) {
+        console.error("Create Career Error:", err);
+        res.status(500).json({ error: 'Error creando la carrera' });
+    }
+});
+
+// EDITAR CARRERA
 app.put('/api/careers/:id', verifyUser, async (req, res) => {
     const { rol } = req.staffProfile;
-    
-    // REGLA: Secretaria NO puede editar carreras
-    if (rol === 'secretaria') {
-        return res.status(403).json({ error: 'Las secretarias no pueden editar carreras.' });
-    }
+    if (rol === 'secretaria') return res.status(403).json({ error: 'Las secretarias no pueden editar carreras.' });
 
     try {
         const { id } = req.params;
         const updates = req.body;
-        delete updates.id; // Protegemos el ID
+        delete updates.id; 
 
         const { error } = await supabase.from('resumen_carreras').update(updates).eq('id', id);
         if (error) throw error;
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: 'Error actualizando carrera' });
+    }
+});
+
+// ELIMINAR CARRERA (SOLO ADMIN)
+app.delete('/api/careers/:id', verifyUser, async (req, res) => {
+    const { rol } = req.staffProfile;
+    if (rol !== 'admin') return res.status(403).json({ error: 'Acceso denegado: Solo administradores pueden eliminar carreras.' });
+
+    try {
+        const { id } = req.params;
+        const { error } = await supabase.from('resumen_carreras').delete().eq('id', id);
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        console.error("Delete Career Error:", err);
+        res.status(500).json({ error: 'Error eliminando la carrera' });
     }
 });
 
@@ -367,7 +412,6 @@ app.put('/api/staff/:id', verifyUser, async (req, res) => {
     const currentUser = req.staffProfile;
     try {
         if (currentUser.rol === 'admin') {
-             // Admin puede poner cualquier rol, incluido null (para quitar permisos)
             await supabase.from('perfil_staff').update({ rol: newRole, sede: newSede }).eq('id', req.params.id);
         } else if (currentUser.rol === 'asesor') {
             if (newRole !== 'secretaria') return res.status(403).json({ error: 'Solo puedes asignar Secretarias' });
@@ -377,7 +421,6 @@ app.put('/api/staff/:id', verifyUser, async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Error actualizando staff' }); }
 });
 
-// ELIMINAR STAFF (DELETE) - Nuevo
 app.delete('/api/staff/:id', verifyUser, async (req, res) => {
     const { rol } = req.staffProfile;
     if (rol !== 'admin') return res.status(403).json({ error: 'Solo Admin elimina cuentas' });
@@ -393,7 +436,6 @@ app.delete('/api/staff/:id', verifyUser, async (req, res) => {
 // 7. SISTEMA ADMIN (CONTROL GLOBAL DEL BOT)
 // ==========================================
 
-// Helper para obtener estado desde DB
 async function getBotStatus() {
     try {
         const { data, error } = await supabase
@@ -406,7 +448,6 @@ async function getBotStatus() {
     } catch (e) { return true; }
 }
 
-// CAMBIAR ESTADO BOT
 app.post('/api/admin/bot-status', verifyUser, async (req, res) => {
     const { rol } = req.staffProfile;
     if (rol !== 'admin') return res.status(403).json({ error: 'Solo admin controla el bot.' });
@@ -415,21 +456,18 @@ app.post('/api/admin/bot-status', verifyUser, async (req, res) => {
     if (typeof is_active !== 'boolean') return res.status(400).json({ error: 'Requiere is_active boolean.' });
 
     await supabase.from('bot_settings').upsert({ id: 1, is_active: is_active, updated_at: new Date() });
-    console.log(`🔌 [SISTEMA] Bot Global cambiado a: ${is_active}`);
     return res.json({ success: true, is_active });
 });
 
-// LEER ESTADO BOT
 app.get('/api/admin/bot-status', verifyUser, async (req, res) => {
     const isActive = await getBotStatus();
     res.json({ active: isActive, is_active: isActive });
 });
 
 // ==========================================
-// 8. BOT ANALISTA (RAG)
+// 8. BOT ANALISTA (RAG CORREGIDO)
 // ==========================================
 
-// ... (Funciones nodeReadChat y nodeReadDrive se mantienen igual que antes) ...
 async function nodeReadChat(studentId) {
     const { data: student } = await supabase.from('student').select('telefono1, telefono2').eq('id', studentId).single();
     if (!student) return "Sin historial.";
@@ -447,11 +485,19 @@ async function nodeReadChat(studentId) {
     if (!chats || chats.length === 0) return "No hay historial reciente.";
 
     return chats.map(c => {
-        const msg = c.message;
-        const role = msg.type === 'human' ? 'Alumno' : 'Bot';
-        let content = msg.content;
+        let rawMsg = c.message;
+        if (typeof rawMsg === 'string') {
+            try { rawMsg = JSON.parse(rawMsg); } catch(e){}
+        }
+
+        const role = rawMsg.type === 'human' ? 'Alumno' : 'Bot';
+        let content = rawMsg.content;
+        
         if (typeof content === 'string' && content.includes('output')) {
-             try { content = JSON.parse(content).output.mensaje_1 || content; } catch(e){}
+             try { 
+                 const inner = JSON.parse(content);
+                 content = inner.output.message || inner.output.mensaje_1 || content; 
+             } catch(e){}
         }
         if (typeof content === 'string' && content.includes('Esta es la url: https://drive.google.com')) {
             content = `[EL USUARIO ENVIÓ UNA IMAGEN/ARCHIVO]`;
@@ -482,13 +528,11 @@ async function nodeReadDrive(studentId) {
 }
 
 app.post('/api/bot/analyze', verifyUser, async (req, res) => {
-    // 1. Check Global Status
     const systemActive = await getBotStatus();
     if (systemActive === false) return res.json({ answer: "⛔ IA desactivada por administrador." });
 
     const { studentId, question } = req.body;
-    console.log(`🤖 [BOT] ID: ${studentId}`);
-
+    
     if (!process.env.OPENROUTER_API_KEY) return res.json({ answer: "⚠️ Error: Falta API Key." });
 
     try {
@@ -519,11 +563,10 @@ app.post('/api/bot/analyze', verifyUser, async (req, res) => {
 });
 
 // ==========================================
-// 9. ARCHIVOS Y MENSAJES (Mismos endpoints)
+// 9. ARCHIVOS Y MENSAJES
 // ==========================================
 
 app.post('/api/students/phone/:phone/documents', verifyUser, upload.single('file'), async (req, res) => {
-  /* ... (Mismo código de subida de archivos) ... */
   const rawPhone = req.params.phone;
   try {
     if (!drive) return res.status(503).json({ error: 'Drive off' });
@@ -548,7 +591,6 @@ app.post('/api/students/phone/:phone/documents', verifyUser, upload.single('file
 });
 
 app.get('/api/documents/:id/download', verifyUser, async (req, res) => {
-    /* ... (Mismo código descarga) ... */
     try {
         if (!drive) return res.status(503).json({ error: 'Drive off' });
         const { data: doc } = await supabase.from('student_documents').select('*').eq('id', req.params.id).single();
@@ -561,7 +603,6 @@ app.get('/api/documents/:id/download', verifyUser, async (req, res) => {
 });
 
 app.post('/api/messages', verifyUser, async (req, res) => {
-    /* ... (Mismo código mensajes) ... */
     try {
         const { studentId, messageText, phone } = req.body;
         const { data: student } = await supabase.from('student').select('codPuntoKennedy').eq('id', studentId).single();
